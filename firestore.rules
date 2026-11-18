@@ -1,0 +1,75 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Who is the caller? ──────────────────────────────────────────────
+    // Every workspace lives at users/{uid}, where uid is the ADMIN's uid.
+    // A member's own profile (users/{memberUid}) carries workspaceId (= admin uid) and memberId
+    // (= their record in users/{admin}/members). Both are written by Cloud Functions only.
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function isAdmin(ws) {
+      return request.auth != null && request.auth.uid == ws;
+    }
+    function isMemberOf(ws) {
+      return request.auth != null && profile().get('workspaceId', request.auth.uid) == ws;
+    }
+    function myMemberId() {
+      return profile().get('memberId', '');
+    }
+    function isMe(id) {
+      return myMemberId() != '' && id == myMemberId();
+    }
+
+    match /users/{uid} {
+      // Profile: readable by its owner; created once at sign-up as admin of their own workspace.
+      // Never writable afterwards from the client, so nobody can change workspaceId/memberId/sessionsRevokedAt.
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if request.auth != null && request.auth.uid == uid
+                    && request.resource.data.workspaceId == uid
+                    && !('memberId' in request.resource.data)
+                    && !('sessionsRevokedAt' in request.resource.data);
+      allow update, delete: if false;
+
+      // Projects: admin full access. A member can only READ projects they are part of.
+      match /projects/{id} {
+        allow read: if isAdmin(uid) || (isMemberOf(uid) && myMemberId() != '' && myMemberId() in resource.data.get('memberIds', []));
+        allow create, update, delete: if isAdmin(uid);
+      }
+
+      // Tasks: admin full access. A member can only read and update tasks assigned to them
+      // (and cannot reassign them or move them to another project).
+      match /tasks/{id} {
+        allow read: if isAdmin(uid) || (isMemberOf(uid) && isMe(resource.data.get('assigneeId', '')));
+        allow create, delete: if isAdmin(uid);
+        allow update: if isAdmin(uid) || (
+          isMemberOf(uid)
+          && isMe(resource.data.get('assigneeId', ''))
+          && request.resource.data.get('assigneeId', '') == resource.data.get('assigneeId', '')
+          && request.resource.data.projectId == resource.data.projectId
+        );
+      }
+
+      // Members list: readable inside the workspace (names/photos are needed to show teams); only the admin edits it.
+      match /members/{id} {
+        allow read: if isAdmin(uid) || isMemberOf(uid);
+        allow write: if isAdmin(uid);
+      }
+
+      // Clients: admin only.
+      match /clients/{id} {
+        allow read, write: if isAdmin(uid);
+      }
+    }
+
+    // Lookup used by "Forgot password" to answer "does this user exist?".
+    // Single-document reads only (no listing). Written at sign-up or by Cloud Functions.
+    match /emailIndex/{email} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if request.auth != null && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}
